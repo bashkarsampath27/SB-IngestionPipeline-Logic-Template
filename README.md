@@ -1,7 +1,7 @@
-# Ingestion Pipeline — Architecture & Logic Reference
+# Sequential Ingestion Pipeline — Reference Architecture for Single-Worker Kubernetes Deployments
 
-Author: Bashkar Sampath
-Date: June 2026
+**Author:** Bashkar Sampath
+**Date:** June 2026
 
 A reusable design template for event-triggered, sequentially-processed,
 single-worker ingestion pipelines on a multi-pod Kubernetes cluster.
@@ -10,8 +10,8 @@ single-worker ingestion pipelines on a multi-pod Kubernetes cluster.
 
 ## 1. Pattern Overview
 
-An external event registers a job in a PostgreSQL job table. A scheduled
-cron on every pod races to acquire a singleton pipeline lock. The winner
+An external event registers a job in a PostgreSQL job table. A fixed-delay
+scheduler on every pod races to acquire a singleton pipeline lock. The winner
 becomes the exclusive worker and processes jobs sequentially. When the
 queue is empty, the lock is released and any pod may acquire it on the
 next cycle.
@@ -21,13 +21,30 @@ next cycle.
 - Automatic retry with cooldown on transient failures
 - Poison pill isolation with admin-controlled recovery
 - Stuck job detection via heartbeat, not lock coordination
-- Priority queue support
+- Stream-ordered processing where sequence is an invariant
 - Full append-only audit trail per job
 - No external systems — native PostgreSQL only
 
 **What this pattern does not solve:**
 - Parallel high-throughput processing (deliberately single-worker)
 - Sub-second scheduling latency
+
+---
+
+## When to Use / When Not to Use
+
+**Use this when:**
+- File or event ordering matters — downstream state is incremental
+- Medium throughput is acceptable (one job per scheduler cycle)
+- PostgreSQL is your primary datastore
+- You want no external coordinator (no Redis, Kafka, ZooKeeper)
+- Operational simplicity outweighs raw throughput
+
+**Do not use this when:**
+- Jobs are fully independent and can be processed in any order
+- You need parallel workers for throughput
+- Backlog recovery must be fast (large queue, slow processor)
+- Sub-second trigger-to-execution latency is required
 
 ---
 
@@ -129,15 +146,16 @@ IngestionController      Receives the external event trigger. Calls
                          No processing here.
                          ← DOMAIN SPECIFIC: event parsing, source extraction
 
-IngestionScheduler       @Scheduled cron. Acquires pipeline lock. Drains
+IngestionScheduler       Fixed-delay scheduler. Acquires pipeline lock. Drains
                          job queue sequentially. Releases lock.
 
-LockHeartbeatTask        @Scheduled task (separate). If ownsPipelineLock=true,
-                         updates lock.heartbeat_at every 30 seconds.
+LockHeartbeatTask        Fixed-delay task (separate from scheduler). If
+                         ownsPipelineLock=true, updates lock.heartbeat_at
+                         every 30 seconds. Independent of job processing.
 
-IngestionJanitor         @Scheduled cron (separate). Two responsibilities:
+IngestionJanitor         Fixed-delay scheduler (separate). Two responsibilities:
                          (1) Reset stale pipeline lock to IDLE.
-                         (2) Mark stuck jobs as STUCK_RELEASED.
+                         (2) Mark stuck PROCESSING jobs as STUCK_RELEASED.
 
 IngestionFlow            Pure orchestration. processJob(id).
                          claim → execute domain work → complete/fail.
@@ -165,13 +183,14 @@ AuditState               Enum of all job status values.
 
 ```sql
 CREATE TABLE ingestion_pipeline_lock (
-    id           INT       PRIMARY KEY,
-    status       VARCHAR   NOT NULL,       -- IDLE | ACTIVE
-    owner_id     VARCHAR   NULL,           -- Kubernetes pod name (HOSTNAME env var)
-    heartbeat_at TIMESTAMP NULL            -- updated every 30s by lock owner
+    id           INT         PRIMARY KEY,
+    status       VARCHAR     NOT NULL,       -- IDLE | ACTIVE
+    owner_id     VARCHAR     NULL,           -- Kubernetes pod name (HOSTNAME env var)
+    heartbeat_at TIMESTAMPTZ NULL            -- updated every 30s by lock owner
 );
 
 -- Singleton row. Insert once. Never insert again.
+-- CHECK (id = 1) enforced at DB level to prevent accidental multi-row misuse.
 INSERT INTO ingestion_pipeline_lock VALUES (1, 'IDLE', NULL, NULL);
 ```
 
@@ -199,12 +218,12 @@ CREATE TABLE ingestion_audit_log (
     -- Queue control
     status               VARCHAR(32) NOT NULL DEFAULT 'CREATED',
     retry_count          INT         NOT NULL DEFAULT 0,
-    retry_after          TIMESTAMP   NULL,
+    retry_after          TIMESTAMPTZ NULL,
 
-    -- Timestamps
-    request_received_at  TIMESTAMP   NOT NULL,
-    status_updated_at    TIMESTAMP   NOT NULL,
-    heartbeat_at         TIMESTAMP   NULL,
+    -- Timestamps (all UTC, timezone-aware)
+    request_received_at  TIMESTAMPTZ NOT NULL,
+    status_updated_at    TIMESTAMPTZ NOT NULL,
+    heartbeat_at         TIMESTAMPTZ NULL,
 
     -- Source metadata                        ← DOMAIN SPECIFIC
     bucket               VARCHAR     NOT NULL,
@@ -341,19 +360,19 @@ STEP 1 — ACQUIRE PIPELINE LOCK
   No entity load. No @Version. WHERE status='IDLE' is the CAS.
   Two pods race: one UPDATE gets 1 row, one gets 0. Database resolves it.
 
-STEP 2 — FAILURE_POISON CHECK
+STEP 2 — DRAIN QUEUE (while loop)
 
-  SELECT EXISTS (
-    SELECT 1 FROM ingestion_audit_log WHERE status = 'FAILURE_POISON'
-  )
+  Top of every iteration:
 
-  true  → log clearly. Release lock. Return.
-           Processing halted until admin resolves ALL FAILURE_POISON records.
-  false → proceed.
+  a. FAILURE_POISON CHECK
+     SELECT EXISTS (SELECT 1 FROM ingestion_audit_log WHERE status = 'FAILURE_POISON')
+     true  → log clearly. Break loop. Release lock. Return.
+              Processing halted until admin resolves ALL FAILURE_POISON records.
+              Checked each iteration so a job becoming FAILURE_POISON mid-cycle
+              halts immediately on the next iteration, not after the full queue drains.
+     false → proceed.
 
-STEP 3 — DRAIN QUEUE (while loop)
-
-  a. Query next eligible job — strict sequential:
+  b. Query next eligible job — strict sequential:
 
      WITH next_position AS (
          SELECT MIN(stream_position) AS pos
@@ -366,40 +385,43 @@ STEP 3 — DRAIN QUEUE (while loop)
      WHERE  a.status IN ('CREATED', 'FAILURE_RETRYABLE', 'STUCK_RELEASED')
      AND    (a.retry_after IS NULL OR a.retry_after <= NOW())
 
-     None found → break.
+     None found → break. Queue empty or minimum position is in cooldown.
 
      Why this query:
        The CTE finds the lowest non-terminal stream_position.
        The outer query checks if that position is actually claimable.
 
        If position 2 is FAILURE_RETRYABLE with retry_after > NOW():
-         CTE returns pos=2. Outer query finds it but retry_after gates it.
-         Returns nothing. Scheduler waits. Position 3 does NOT skip ahead.
+         CTE returns pos=2. Outer query gates on retry_after. Returns nothing.
+         Scheduler waits. Position 3 does NOT skip ahead.
 
        If position 2 is FAILURE_POISON:
-         Caught by Step 2 halt check before this query runs.
+         Caught by the poison check above on this iteration.
 
-       If position 2 is LOCKED or PROCESSING:
-         Pipeline lock check (Step 1) returns before this query runs.
+       If position 2 is PROCESSING:
+         Pipeline lock ensures only one worker is active. This shouldn't
+         occur — if seen, it means the lock was acquired while a job was
+         already running, which indicates a janitor/recovery scenario.
 
        Stream order is an invariant. No job processes before its predecessor
        reaches a terminal state (COMPLETED or ADMIN_DISMISSED).
 
-  b. Claim → PROCESSING in one transaction (claimAndStartProcessing)
+  c. Claim → PROCESSING in one transaction (claimAndStartProcessing)
      Set job.status = PROCESSING, job.heartbeat_at = NOW().
      Save → @Version check on the job row.
      OptimisticLockingFailureException → extremely unlikely under pipeline
      lock but handled: log, break.
 
-     No LOCKED intermediate state. Claim and start are atomic.
+     No intermediate state. Claim and start are atomic.
 
-  c. IngestionFlow.processJob(jobId)
+  d. IngestionFlow.processJob(jobId)
      See: Claim Protocol, Heartbeat Protocol, Retry Protocol.
 
-  d. Exception in processJob → job is already FAILURE_RETRYABLE or
-     FAILURE_POISON. Log. Continue loop (next iteration picks up next job).
+  e. Exception in processJob → job is already FAILURE_RETRYABLE or
+     FAILURE_POISON. Log. Continue to next iteration (poison check fires
+     at top of next iteration if FAILURE_POISON was set).
 
-STEP 4 — RELEASE PIPELINE LOCK (finally block)
+STEP 3 — RELEASE PIPELINE LOCK (finally block)
 
   lockRepository.release(podId);
     → UPDATE ingestion_pipeline_lock
@@ -627,9 +649,14 @@ Dependency:
 ```
 Trigger:  retry_count reaches MAX_RETRIES on a PROCESSING failure.
 
-Effect:   callForIncident(exception) fires synchronously.
-          status = FAILURE_POISON.
-          All scheduler cycles halt at Step 2 until resolved.
+Effect:   1. status = FAILURE_POISON persisted first (REQUIRES_NEW tx commits).
+          2. callForIncident(exception) called after state is durable.
+             Synchronous with explicit timeout and try/catch — failure to
+             notify is logged but does not affect the FAILURE_POISON state.
+             The DB state transition is authoritative regardless of whether
+             the incident call succeeds.
+          3. All scheduler drain loop iterations check for FAILURE_POISON
+             at the top — halts on next iteration after the record is written.
 
 Scope:    Global. One FAILURE_POISON blocks all job processing.
           Intentional. A systemic failure (schema change, corrupt source
@@ -639,6 +666,11 @@ Scope:    Global. One FAILURE_POISON blocks all job processing.
 Multiple FAILURE_POISON records:
           ALL must be resolved before the scheduler resumes.
           Admin must explicitly handle each one — reset or dismiss.
+
+callForIncident() must include:
+          job id, source metadata (bucket/objectName), error_message,
+          retry_count, last state_history entry.
+          Give on-call everything they need without a DB query.
 ```
 
 ---
@@ -647,6 +679,18 @@ Multiple FAILURE_POISON records:
 
 All admin operations validate the current status before executing.
 All transitions append an entry to `state_history`.
+
+**Status guard is enforced at the SQL level, not only in service layer:**
+```sql
+-- Example: reset
+UPDATE ingestion_audit_log
+SET    status = 'CREATED', retry_count = 0, retry_after = NULL, ...
+WHERE  id = :id
+AND    status = 'FAILURE_POISON'    -- atomic guard
+```
+If the update affects 0 rows, the operation is rejected. This prevents
+races between concurrent admin actions (one operator resets while another
+dismisses) and stale UI submissions.
 
 ### POST /ingestion/admin/{id}/reset
 
@@ -708,6 +752,17 @@ PROCESSING_STUCK_THRESHOLD >> per-batch commit time
   15min threshold >> any reasonable batch commit time.
   File size is irrelevant. Heartbeat interval is the only dependency.
 ```
+
+**Critical invariant for PROCESSING_STUCK_THRESHOLD:**
+
+> The worst-case time between two consecutive successful `tx.heartbeat(jobId)`
+> calls must remain comfortably below `PROCESSING_STUCK_THRESHOLD`.
+
+If a single batch transformation + commit can take longer than this threshold,
+a healthy worker will be incorrectly marked STUCK_RELEASED. Tune either the
+batch size (smaller batches = more frequent heartbeats) or raise the threshold.
+The threshold is a runtime assumption that must be validated against your
+actual batch durations.
 
 ---
 
@@ -838,7 +893,7 @@ guarantees single-writer access at all times.
 - [ ] `AuditState` enum: CREATED, PROCESSING, FAILURE_RETRYABLE,
       FAILURE_POISON, STUCK_RELEASED, COMPLETED, ADMIN_DISMISSED
 - [ ] `IngestionAuditLog.start()` factory: sets CREATED, request_received_at,
-      status_updated_at, stateHistory = [] — stream_position assigned by DB sequence
+      status_updated_at, state_history = '[]' — stream_position assigned by DB sequence
 
 ### Repository
 - [ ] `PipelineLockRepository` — all native `@Modifying @Query`, no entity, no Hibernate lifecycle
