@@ -1,0 +1,138 @@
+@startuml Distributed Lock and Processing Pipeline
+
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 10
+skinparam sequenceParticipantBorderColor #444444
+skinparam sequenceParticipantBackgroundColor #F0F4FF
+skinparam sequenceLifeLineBorderColor #888888
+skinparam noteBorderColor #CCAA00
+skinparam noteBackgroundColor #FFFDE7
+
+title Sequential Ingestion Pipeline — Distributed Lock & Processing
+
+participant "Eventarc\n(GCS onFinalize)" as EA #LightGreen
+participant "IngestionController" as IC #LightBlue
+database "ingestion_audit_log\n(PostgreSQL)" as IAL #LightYellow
+database "ingestion_pipeline_lock\n(PostgreSQL)" as IPL #LightYellow
+participant "Pod A\nIngestionScheduler" as PA #LightBlue
+participant "Pod B\nIngestionScheduler" as PB #Pink
+participant "LockHeartbeatTask\n(Pod A)" as HB #LightCyan
+participant "IngestionJanitor\n(all pods)" as JAN #Thistle
+participant "IngestionFlow\n+ Processor" as FLOW #LightBlue
+
+== Event Registration (Ack-Fast) ==
+
+EA -> IC : POST /ingestion-event\n(bucket, objectName, gcs_generation)
+activate IC
+
+IC -> IAL : INSERT status=CREATED\n(bucket, objectName, gcs_generation, stream_position)\nON CONFLICT (bucket,objectName,gcs_generation) → ignore
+activate IAL
+IAL --> IC : success → new row\nduplicate → 0 rows
+deactivate IAL
+
+alt New event
+    IC --> EA : 202 Accepted
+else Duplicate (unique constraint)
+    IC --> EA : 204 No Content
+end
+deactivate IC
+
+== Lock Acquisition Race (every 30s fixedDelay) ==
+
+PA -> IPL : UPDATE pipeline_lock\nSET status=ACTIVE, owner_id='pod-a', heartbeat_at=NOW()\nWHERE id=1 AND status='IDLE'
+activate IPL
+PB -> IPL : UPDATE pipeline_lock\nSET status=ACTIVE, owner_id='pod-b', heartbeat_at=NOW()\nWHERE id=1 AND status='IDLE'
+
+IPL --> PA : rows=1 (WON)
+IPL --> PB : rows=0 (LOST)
+deactivate IPL
+
+note over PA : ownsPipelineLock = true
+note over PB : return — wait for next cycle
+
+== Pod A: Leader Processing ==
+
+loop Drain queue while CREATED jobs exist
+
+    PA -> IAL : EXISTS (status='FAILURE_POISON')?
+    activate IAL
+    IAL --> PA : false → proceed
+    deactivate IAL
+
+    PA -> IAL : SELECT next eligible job\nvia stream_position CTE\nWHERE status IN (CREATED,\nFAILURE_RETRYABLE,\nSTUCK_RELEASED)\nAND retry_after IS NULL\nOR retry_after <= NOW()
+    activate IAL
+    IAL --> PA : job (id, stream_position, bucket, ...)
+    deactivate IAL
+
+    PA -> IAL : UPDATE status=PROCESSING\nheartbeat_at=NOW()\nWHERE id=? AND version=N\n(claimAndStartProcessing)
+    activate IAL
+    IAL --> PA : claimed (version=N+1)
+    deactivate IAL
+
+    PA -> FLOW : processJob(jobId)
+    activate FLOW
+
+    loop Per batch commit
+        FLOW -> IAL : saveBatch(entities)\n@Transactional(REQUIRES_NEW)
+        FLOW -> IAL : heartbeat(jobId)\nSET heartbeat_at=NOW()\n@Transactional(REQUIRES_NEW)
+    end
+
+    alt Success
+        FLOW --> PA : IngestionResult
+        PA -> IAL : UPDATE status=COMPLETED\nappend state_history
+    else Failure, retry_count < MAX
+        FLOW --> PA : exception
+        PA -> IAL : UPDATE status=FAILURE_RETRYABLE\nretry_count++\nretry_after=NOW()+cooldown
+    else Failure, retry_count = MAX
+        FLOW --> PA : exception
+        PA -> IAL : UPDATE status=FAILURE_POISON\ncallForIncident()
+        PA -> PA : break drain loop\n(poison check fires next iteration)
+    end
+
+    deactivate FLOW
+
+end
+
+== Queue Empty — Lock Release ==
+
+PA -> IPL : UPDATE SET status=IDLE\nowner_id=NULL, heartbeat_at=NULL\nWHERE owner_id='pod-a'
+note over PA : ownsPipelineLock = false\n(set BEFORE release)
+
+== Heartbeat — Independent Task (Pod A, while lock held) ==
+
+loop Every 30s (fixedDelay)
+    HB -> HB : if (!ownsPipelineLock) return
+    HB -> IPL : UPDATE heartbeat_at=NOW()\nWHERE owner_id='pod-a'
+    note over HB : Fires regardless of\nbatch state.\nIndependent of job processing.
+end
+
+== Janitor — Crash Recovery (all pods, every 60s) ==
+
+JAN -> IPL : Sweep 1: Reset stale lock\nUPDATE SET status=IDLE\nWHERE status=ACTIVE\nAND heartbeat_at < NOW()-5min
+activate IPL
+IPL --> JAN : lock reset (if stale)
+deactivate IPL
+
+JAN -> IAL : Sweep 2: Release stuck jobs\nUPDATE SET status=STUCK_RELEASED\nWHERE status=PROCESSING\nAND heartbeat_at < NOW()-15min
+activate IAL
+IAL --> JAN : stuck jobs released
+deactivate IAL
+
+note over JAN : STUCK_RELEASED jobs re-enter\nscheduler queue at original\nstream_position.\nretry_count unchanged.
+
+== Pod Failure Scenario ==
+
+note over PA,HB #Pink : Pod A dies mid-processing.\nheartbeat_at stops updating.
+
+JAN -> IPL : heartbeat_at stale > 5min\n→ RESET lock to IDLE
+JAN -> IAL : PROCESSING job stale > 15min\n→ STUCK_RELEASED
+
+PB -> IPL : Next cycle: UPDATE WHERE status=IDLE
+activate IPL
+IPL --> PB : rows=1 (Pod B now leader)
+deactivate IPL
+
+note over PB : Resumes from STUCK_RELEASED\nat original stream_position
+
+@enduml
